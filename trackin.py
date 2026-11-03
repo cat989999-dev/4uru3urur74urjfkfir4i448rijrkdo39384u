@@ -35,7 +35,8 @@ TRACK_GROUP_ID = -1003946482336
 REQUIRED_USERNAME_TAG = "@redcube"
 FSUB_CHANNEL = "@redcube_en"  
 GROUP_INVITE_LINK = "https://t.me/+rdKCTKOlxUE1Mjc8"
-BANNED_PROMOS = ["@dices", "@raika", "@booplay", "@Axoms", "@giftsggapp", "@royaldices"]
+BANNED_PROMOS = ["dices", "raika", "booplay", "@
+Axoms", "giftsggapp", "royaldices"]
 
 # ================= HTTP SESSION (For Fast API Calls) =================
 HTTP_SESSION: aiohttp.ClientSession | None = None
@@ -124,9 +125,12 @@ async def send_msg(chat_id: int, text: str, markup=None, parse_mode="HTML", repl
 async def edit_msg(chat_id: int, message_id: int, text: str, markup=None, parse_mode="HTML", disable_web_page_preview=True):
     try:
         return await tg("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
-    except Exception:
+    except Exception as e:
+        # AVOID SPAM: Check if the error is just Pyrogram saying message hasn't changed
+        err = str(e).lower()
+        if "not modified" in err or "message is not modified" in err:
+            return None 
         return await send_msg(chat_id, text, markup=markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
-
 
 # ================= INITIALIZATION =================
 app = Client("my_advanc9768e6d_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -581,7 +585,7 @@ async def lang_cmd(client: Client, message: Message):
         [("English", "lang_en", "primary", "🇬🇧"), ("Русский", "lang_ru", "danger", "🇷🇺")],
         [("हिंदी (Hindi)", "lang_hi", "success", "🇮🇳")]
     )
-    await send_msg(message.chat.id, "Select your language / Выберите язык / भाषा चुनें:", markup=btns)
+    await send_msg(message.chat.id, f"Select your language / Выберите язык / भाषा चुनें:", markup=btns)
 
 @app.on_message(filters.command("access"))
 async def access_cmd(client: Client, message: Message):
@@ -778,12 +782,40 @@ async def leaderboard_cmd(client: Client, message: Message):
         
     await send_msg(message.chat.id, text, markup=btns, disable_web_page_preview=True)
 
-@app.on_message(filters.command(["balance", "bal"]) & filters.private)
+@app.on_message(filters.command(["balance", "bal"]))
 async def balance_cmd(client: Client, message: Message):
     if await check_double_msg(message.from_user.id): return
-    if not await pass_fsub(client, message): return
+    if message.chat.type.name == "PRIVATE" and not await pass_fsub(client, message): return
     user = await get_or_create_user(message.from_user.id, message.from_user)
     await send_msg(message.chat.id, f"{pe('💰')} <b>Your Current Balance:</b> ${round(user.get('balance', 0.0), 2)}")
+
+@app.on_message(filters.command("tip") & filters.group)
+async def tip_cmd(client: Client, message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return await send_msg(message.chat.id, f"{pe('⚠️')} Please reply to a user to tip them.")
+
+    sender_id = message.from_user.id
+    target_id = message.reply_to_message.from_user.id
+
+    if sender_id == target_id:
+        return await send_msg(message.chat.id, f"{pe('❌')} You cannot tip yourself.")
+
+    try:
+        amount = float(message.command[1])
+        if amount <= 0: raise ValueError
+    except:
+        return await send_msg(message.chat.id, f"{pe('✏️')} Usage: /tip [amount]")
+
+    sender = await get_or_create_user(sender_id, message.from_user)
+    if sender.get("balance", 0.0) < amount:
+        return await send_msg(message.chat.id, f"{pe('❌')} Insufficient balance! You have ${round(sender.get('balance', 0.0), 2)}.")
+
+    await users_db.update_one({"user_id": sender_id}, {"$inc": {"balance": -amount}})
+    await users_db.update_one({"user_id": target_id}, {"$inc": {"balance": amount}}, upsert=True)
+
+    target_name = message.reply_to_message.from_user.first_name or "User"
+    await send_msg(message.chat.id, f"{pe('✅')} <b>Tip Successful!</b>\nYou tipped ${amount} to {html.escape(target_name)}.")
+
 
 @app.on_message(filters.command("support") & filters.private)
 async def support_cmd(client: Client, message: Message):
@@ -853,60 +885,49 @@ async def handle_join_request(client: Client, request: ChatJoinRequest):
     # Fake Account Auto Reject Logic
     user = request.from_user
     if user.is_bot or getattr(user, 'is_fake', False) or getattr(user, 'is_scam', False) or getattr(user, 'is_restricted', False):
-        try:
-            await client.decline_chat_join_request(chat_id, user_id)
+        try: await client.decline_chat_join_request(chat_id, user_id)
         except: pass
         return
         
     conf = await get_config()
-    
-    # Stop auto-approval for group if affiliate is disabled, EXCEPT for admins
-    if chat_id == TRACK_GROUP_ID and not conf.get("affiliate_enabled", True):
-        if not await is_admin(user_id):
-            return  # Leave request pending
+    is_new_affiliate = False
 
-    # Auto-approve for channels or allowed group requests
-    try:
-        await client.approve_chat_join_request(chat_id, user_id)
-    except Exception: pass
-    
     # Affiliate tracking only happens in the main tracking group
     if chat_id == TRACK_GROUP_ID:
         joining_user = await get_or_create_user(user_id, request.from_user)
 
-        # Check if they have EVER joined before (Global exploit fix)
-        if not joining_user.get("ever_joined_group", False):
-            # Mark them as joined so they can never be counted again
-            await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
-
-            if request.invite_link and request.invite_link.name and request.invite_link.name.startswith("Affiliate_"):
-                # Double check config in case it changed mid-flight
-                if not conf.get("affiliate_enabled", True):
-                    return # Skip affiliate processing if system is toggled off
-
-                inviter_id = int(request.invite_link.name.split("_")[1])
-                inviter_data = await get_or_create_user(inviter_id)
-                
-                if user_id not in inviter_data.get("affiliates", []) and user_id not in inviter_data.get("left_affiliates", []):
-                    await users_db.update_one({"user_id": inviter_id}, {"$addToSet": {"affiliates": user_id}})
+        if request.invite_link and request.invite_link.name and request.invite_link.name.startswith("Affiliate_"):
+            if conf.get("affiliate_enabled", True):
+                if not joining_user.get("ever_joined_group", False):
+                    is_new_affiliate = True
+                    inviter_id = int(request.invite_link.name.split("_")[1])
                     
-                    new_count = len(inviter_data.get("affiliates", [])) + 1
-                    
-                    if new_count % conf["affiliate_req"] == 0:
-                        reward = conf["affiliate_reward"]
-                        await users_db.update_one({"user_id": inviter_id}, {"$inc": {"balance": reward}})
-                        lang = await get_lang(inviter_id)
-                        msg = f"{pe('🎉')} <b>Congratulations!</b> You reached {conf['affiliate_req']} members. ${reward} added!"
-                        if lang == "ru": msg = f"{pe('🎉')} <b>Поздравляем!</b> Вы пригласили {conf['affiliate_req']} участников. Вам начислено ${reward}!"
-                        if lang == "hi": msg = f"{pe('🎉')} <b>बधाई हो!</b> आपने {conf['affiliate_req']} मेंबर्स जोड़ लिए हैं। आपके वॉलेट में ${reward} जुड़ गए हैं!"
-                        try: await send_msg(inviter_id, msg)
+                    # NEW Affiliate! Send to admins for Accept/Reject.
+                    admin_text = f"{pe('🆕')} <b>New Affiliate Request!</b>\n\n{pe('👥')} <b>User:</b> {request.from_user.mention} (<code>{user_id}</code>)\n{pe('👑')} <b>Invited by:</b> <code>{inviter_id}</code>"
+                    btns = kb([
+                        ("Accept", f"jacc_{user_id}_{inviter_id}", "success", "✅"),
+                        ("Reject", f"jrej_{user_id}_{inviter_id}", "danger", "❌")
+                    ])
+                    admins = await admins_db.find().to_list(100)
+                    for aid in set([OWNER_ID] + [a["user_id"] for a in admins]):
+                        try: await send_msg(aid, admin_text, markup=btns)
                         except: pass
+                    
+                    return # DO NOT AUTO APPROVE YET, WAITING FOR ADMIN!
+
+    # If it is NOT a new affiliate tracking request needing admin review, auto-approve safely
+    if not is_new_affiliate:
+        try: 
+            await client.approve_chat_join_request(chat_id, user_id)
+            if chat_id == TRACK_GROUP_ID:
+                await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
+        except: pass
 
 @app.on_message(filters.left_chat_member & filters.chat(TRACK_GROUP_ID))
 async def handle_member_leave(client: Client, message: Message):
     left_user_id = message.left_chat_member.id
     
-    # Updates immediately when someone leaves (Works even if affiliate is toggled off)
+    # Updates immediately when someone leaves
     inviter = await users_db.find_one({"affiliates": left_user_id})
     if inviter:
         inviter_id = inviter["user_id"]
@@ -1538,7 +1559,7 @@ async def cb_menu_lang(client: Client, call: CallbackQuery):
         [("हिंदी (Hindi)", "lang_hi", "success", "🇮🇳")],
         [(TR[lang]["btn_back"], "menu_main", "danger", "🔙")]
     )
-    await edit_msg(call.message.chat.id, call.message.id, "Select your language / Выберите язык / भाषा चुनें:", markup=btns)
+    await edit_msg(call.message.chat.id, call.message.id, f"Select your language / Выберите язык / भाषा चुनें:", markup=btns)
 
 @app.on_callback_query(filters.regex("^lang_(en|ru|hi)$"))
 async def cb_set_lang(client: Client, call: CallbackQuery):
@@ -1684,6 +1705,51 @@ async def cb_wd_method_redcube(client: Client, call: CallbackQuery):
     await edit_msg(call.message.chat.id, call.message.id, f"{pe('✅')} Your {method} withdrawal request has been sent to admins.", markup=markup)
 
 # ================= ADMIN BUTTON HANDLERS =================
+@app.on_callback_query(filters.regex(r"^jacc_"))
+async def cb_jacc(client: Client, call: CallbackQuery):
+    if not await is_admin(call.from_user.id): return await call.answer("Admins only.", show_alert=True)
+    _, user_id, inviter_id = call.data.split("_")
+    user_id = int(user_id)
+    inviter_id = int(inviter_id)
+
+    try: await client.approve_chat_join_request(TRACK_GROUP_ID, user_id)
+    except: pass
+
+    await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
+
+    inviter_data = await get_or_create_user(inviter_id)
+    conf = await get_config()
+
+    if user_id not in inviter_data.get("affiliates", []) and user_id not in inviter_data.get("left_affiliates", []):
+        await users_db.update_one({"user_id": inviter_id}, {"$addToSet": {"affiliates": user_id}})
+        new_count = len(inviter_data.get("affiliates", [])) + 1
+        if new_count % conf.get("affiliate_req", 100) == 0:
+            reward = conf.get("affiliate_reward", 3.0)
+            await users_db.update_one({"user_id": inviter_id}, {"$inc": {"balance": reward}})
+            try: await send_msg(inviter_id, f"{pe('🎉')} <b>Congratulations!</b> You reached {conf.get('affiliate_req', 100)} members. ${reward} added!")
+            except: pass
+
+    admin_name = html.escape(call.from_user.first_name or "Admin")
+    await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('✅')} <b>Accepted by {admin_name}</b>", markup=None)
+    await call.answer("Accepted!", show_alert=False)
+
+@app.on_callback_query(filters.regex(r"^jrej_"))
+async def cb_jrej(client: Client, call: CallbackQuery):
+    if not await is_admin(call.from_user.id): return await call.answer("Admins only.", show_alert=True)
+    _, user_id, inviter_id = call.data.split("_")
+    user_id = int(user_id)
+    inviter_id = int(inviter_id)
+
+    try: await client.decline_chat_join_request(TRACK_GROUP_ID, user_id)
+    except: pass
+
+    await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
+    await users_db.update_one({"user_id": inviter_id}, {"$addToSet": {"fake_affiliates": user_id}})
+
+    admin_name = html.escape(call.from_user.first_name or "Admin")
+    await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('❌')} <b>Rejected (Marked Fake) by {admin_name}</b>", markup=None)
+    await call.answer("Rejected!", show_alert=False)
+
 @app.on_callback_query(filters.regex("^tktacc_"))
 async def ticket_accept(client: Client, call: CallbackQuery):
     await call.answer()
@@ -1794,10 +1860,10 @@ async def cb_rain_join(client: Client, call: CallbackQuery):
     
     event = await rain_db.find_one({"_id": event_id})
     if not event:
-        return await call.answer("This event has ended! ❌", show_alert=True)
+        return await call.answer(f"This event has ended! {pe('❌')}", show_alert=True)
         
     if user_id in event.get("participants", []):
-        return await call.answer("You are already participating! ⚠️", show_alert=True)
+        return await call.answer(f"You are already participating! {pe('⚠️')}", show_alert=True)
         
     min_msgs = event.get("min_msgs", 0)
     today = str(datetime.date.today())
@@ -1814,13 +1880,13 @@ async def cb_rain_join(client: Client, call: CallbackQuery):
         return await call.answer(f"You need at least {min_msgs} messages TODAY in this group to participate!\nYou currently have {total_sent} messages today.", show_alert=True)
         
     await rain_db.update_one({"_id": event_id}, {"$addToSet": {"participants": user_id}})
-    await call.answer("You have successfully joined the Rain Event! 💧", show_alert=True)
+    await call.answer(f"You have successfully joined the Rain Event! {pe('💧')}", show_alert=True)
 
 # ================= FSUB CHECK BUTTON HANDLER =================
 @app.on_callback_query(filters.regex("^check_fsub$"))
 async def cb_check_fsub(client: Client, call: CallbackQuery):
     if await is_user_subscribed(client, call.from_user.id):
-        await call.answer("Joined successfully! ✅", show_alert=True)
+        await call.answer(f"Joined successfully! {pe('✅')}", show_alert=True)
         user = await get_or_create_user(call.from_user.id, call.from_user)
         lang = await get_lang(call.from_user.id)
         
@@ -1832,7 +1898,7 @@ async def cb_check_fsub(client: Client, call: CallbackQuery):
         welcome_body = TR[lang]["welcome"].format(tag=REQUIRED_USERNAME_TAG, link=user.get('bio_link', 'No Link Generated'))
         await send_msg(call.message.chat.id, welcome_body, markup=get_main_menu(lang), disable_web_page_preview=True)
     else:
-        await call.answer("You haven't joined yet! Please join the channel first. ⚠️", show_alert=True)
+        await call.answer(f"You haven't joined yet! Please join the channel first. {pe('⚠️')}", show_alert=True)
 
 @app.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
 async def message_handler(client: Client, message: Message):
