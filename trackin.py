@@ -35,8 +35,7 @@ TRACK_GROUP_ID = -1003946482336
 REQUIRED_USERNAME_TAG = "@redcube"
 FSUB_CHANNEL = "@redcube_en"  
 GROUP_INVITE_LINK = "https://t.me/+rdKCTKOlxUE1Mjc8"
-BANNED_PROMOS = ["dices", "raika", "booplay", "@
-Axoms", "giftsggapp", "royaldices"]
+BANNED_PROMOS = ["dices", "raika", "booplay", "Axoms", "giftsggapp", "royaldices"]
 
 # ================= HTTP SESSION (For Fast API Calls) =================
 HTTP_SESSION: aiohttp.ClientSession | None = None
