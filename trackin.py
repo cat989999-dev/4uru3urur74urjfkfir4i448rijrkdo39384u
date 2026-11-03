@@ -125,7 +125,6 @@ async def edit_msg(chat_id: int, message_id: int, text: str, markup=None, parse_
     try:
         return await tg("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
     except Exception as e:
-        # AVOID SPAM: Check if the error is just Pyrogram saying message hasn't changed
         err = str(e).lower()
         if "not modified" in err or "message is not modified" in err:
             return None 
@@ -169,7 +168,7 @@ TR = {
         "verify_fail": f"{pe('❌')} <b>Verification Failed:</b>\nPlease ensure your name contains <code>{{tag}}</code> and your bio has the tracking link.",
         "help": f"{pe('✏️')} <b>Available Commands:</b>\n/start - Open Menu\n/lang - Change Language\n/verify - Verify profile\n/affiliate - Get referral link\n/leaderboard - View Activity\n/rank - View your daily rank\n/balance - Check balance\n/support - Contact support\n/close - Close active ticket",
         "affiliate_link": f"{pe('⛓️')} <b>Your Personal Affiliate Link:</b>\n{{link}}\n\nShare this to invite users. We automatically track valid invites.",
-        "affiliate_stats": f"{pe('📊')} <b>Affiliate Stats:</b>\n{pe('👥')} Real Invites: {{real}}\n{pe('❌')} Left Members: {{left}}\n{pe('🤖')} Fake/Filtered: {{fake}}\n\n{pe('💡')} You get ${{reward}} for every {{req}} valid members.",
+        "affiliate_stats": f"{pe('📊')} <b>Affiliate Stats:</b>\n{pe('👥')} Real Invites (Accepted): {{real}}\n{pe('❌')} Left Members: {{left}}\n{pe('🤖')} Fake/Rejected: {{fake}}\n\n{pe('💡')} You get ${{reward}} for every {{req}} valid members.",
         "affiliate_disabled": f"{pe('⚠️')} <b>Affiliate system is currently disabled by admins.</b>",
         "sup_ask": f"{pe('✏️')} Please describe your issue in a single message. (Reason for support):",
         "sup_sent": f"{pe('✅')} Your request has been sent to the admins. Ticket Number: <b>{{tkt}}</b>\nPlease wait for an admin to accept it.",
@@ -673,7 +672,7 @@ async def affiliate_cmd(client: Client, message: Message):
             invite_link = invite.invite_link
             await users_db.update_one({"user_id": message.from_user.id}, {"$set": {"affiliate_link": invite_link}})
         except:
-            return await send_msg(message.chat.id, f"{pe('❌')} Error creating link. Ensure bot is admin in the tracking group.")
+            return await send_msg(message.chat.id, f"{pe('❌')} Error creating link. Ensure bot is admin in the tracking group with 'Invite Users' permission.")
 
     markup = kb(
         [("Affiliate Status", "menu_aff_stats", "primary", "📊")],
@@ -876,12 +875,14 @@ async def close_cmd(client: Client, message: Message):
     except: pass
         
 # ================= BACKGROUND TRACKERS =================
+
+# --- THIS IS THE CORE OF THE JOIN/AFFILIATE APPROVAL SYSTEM ---
 @app.on_chat_join_request()
 async def handle_join_request(client: Client, request: ChatJoinRequest):
     user_id = request.from_user.id
     chat_id = request.chat.id
     
-    # Fake Account Auto Reject Logic
+    # 1. Fake Account Auto Reject Logic
     user = request.from_user
     if user.is_bot or getattr(user, 'is_fake', False) or getattr(user, 'is_scam', False) or getattr(user, 'is_restricted', False):
         try: await client.decline_chat_join_request(chat_id, user_id)
@@ -891,7 +892,7 @@ async def handle_join_request(client: Client, request: ChatJoinRequest):
     conf = await get_config()
     is_new_affiliate = False
 
-    # Affiliate tracking only happens in the main tracking group
+    # 2. Affiliate tracking happens ONLY in the main tracking group
     if chat_id == TRACK_GROUP_ID:
         joining_user = await get_or_create_user(user_id, request.from_user)
 
@@ -900,21 +901,25 @@ async def handle_join_request(client: Client, request: ChatJoinRequest):
                 if not joining_user.get("ever_joined_group", False):
                     is_new_affiliate = True
                     inviter_id = int(request.invite_link.name.split("_")[1])
+                    inviter_data = await get_or_create_user(inviter_id)
+                    inviter_name = html.escape(inviter_data.get("name", "Unknown"))
                     
                     # NEW Affiliate! Send to admins for Accept/Reject.
-                    admin_text = f"{pe('🆕')} <b>New Affiliate Request!</b>\n\n{pe('👥')} <b>User:</b> {request.from_user.mention} (<code>{user_id}</code>)\n{pe('👑')} <b>Invited by:</b> <code>{inviter_id}</code>"
+                    admin_text = f"{pe('🆕')} <b>New Affiliate Join Request!</b>\n\n{pe('👥')} <b>Joining User:</b> {request.from_user.mention} (<code>{user_id}</code>)\n{pe('👑')} <b>Inviter:</b> <a href='tg://user?id={inviter_id}'>{inviter_name}</a> (<code>{inviter_id}</code>)"
+                    
                     btns = kb([
-                        ("Accept", f"jacc_{user_id}_{inviter_id}", "success", "✅"),
-                        ("Reject", f"jrej_{user_id}_{inviter_id}", "danger", "❌")
+                        ("Accept (Real)", f"jacc_{user_id}_{inviter_id}", "success", "✅"),
+                        ("Reject (Fake)", f"jrej_{user_id}_{inviter_id}", "danger", "❌")
                     ])
+                    
                     admins = await admins_db.find().to_list(100)
                     for aid in set([OWNER_ID] + [a["user_id"] for a in admins]):
                         try: await send_msg(aid, admin_text, markup=btns)
                         except: pass
                     
-                    return # DO NOT AUTO APPROVE YET, WAITING FOR ADMIN!
+                    return # DO NOT AUTO APPROVE YET, WAITING FOR ADMIN'S CHOICE!
 
-    # If it is NOT a new affiliate tracking request needing admin review, auto-approve safely
+    # 3. If it is NOT a new affiliate tracking request needing admin review, auto-approve safely
     if not is_new_affiliate:
         try: 
             await client.approve_chat_join_request(chat_id, user_id)
@@ -926,7 +931,7 @@ async def handle_join_request(client: Client, request: ChatJoinRequest):
 async def handle_member_leave(client: Client, message: Message):
     left_user_id = message.left_chat_member.id
     
-    # Updates immediately when someone leaves
+    # 4. Updates immediately when someone leaves (removes from 'Real', adds to 'Left')
     inviter = await users_db.find_one({"affiliates": left_user_id})
     if inviter:
         inviter_id = inviter["user_id"]
@@ -935,7 +940,7 @@ async def handle_member_leave(client: Client, message: Message):
             {
                 "$pull": {"affiliates": left_user_id},
                 "$addToSet": {"left_affiliates": left_user_id},
-                "$inc": {"balance": -0.03} 
+                "$inc": {"balance": -0.03} # Deduct amount for leaving
             }
         )
 
@@ -1480,7 +1485,7 @@ async def cb_menu_affiliate(client: Client, call: CallbackQuery):
             invite_link = invite.invite_link
             await users_db.update_one({"user_id": user_id}, {"$set": {"affiliate_link": invite_link}})
         except:
-            return await send_msg(call.message.chat.id, f"{pe('❌')} Error creating link. Bot must be admin.")
+            return await send_msg(call.message.chat.id, f"{pe('❌')} Error creating link. Bot must be admin with 'Invite Users' permission.")
             
     markup = kb(
         [("Affiliate Status", "menu_aff_stats", "primary", "📊")],
@@ -1704,6 +1709,8 @@ async def cb_wd_method_redcube(client: Client, call: CallbackQuery):
     await edit_msg(call.message.chat.id, call.message.id, f"{pe('✅')} Your {method} withdrawal request has been sent to admins.", markup=markup)
 
 # ================= ADMIN BUTTON HANDLERS =================
+
+# 1. AFFILIATE ACCEPT BUTTON LOGIC
 @app.on_callback_query(filters.regex(r"^jacc_"))
 async def cb_jacc(client: Client, call: CallbackQuery):
     if not await is_admin(call.from_user.id): return await call.answer("Admins only.", show_alert=True)
@@ -1711,27 +1718,37 @@ async def cb_jacc(client: Client, call: CallbackQuery):
     user_id = int(user_id)
     inviter_id = int(inviter_id)
 
+    # Approve joining request
     try: await client.approve_chat_join_request(TRACK_GROUP_ID, user_id)
     except: pass
 
+    # Set as completely joined so they can't be invited again
     await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
 
+    # Fetch inviter and update database for valid affiliate
     inviter_data = await get_or_create_user(inviter_id)
     conf = await get_config()
 
     if user_id not in inviter_data.get("affiliates", []) and user_id not in inviter_data.get("left_affiliates", []):
         await users_db.update_one({"user_id": inviter_id}, {"$addToSet": {"affiliates": user_id}})
-        new_count = len(inviter_data.get("affiliates", [])) + 1
-        if new_count % conf.get("affiliate_req", 100) == 0:
+        
+        # Get exact updated count
+        updated_inviter = await users_db.find_one({"user_id": inviter_id})
+        new_count = len(updated_inviter.get("affiliates", []))
+        
+        if new_count > 0 and new_count % conf.get("affiliate_req", 100) == 0:
             reward = conf.get("affiliate_reward", 3.0)
             await users_db.update_one({"user_id": inviter_id}, {"$inc": {"balance": reward}})
-            try: await send_msg(inviter_id, f"{pe('🎉')} <b>Congratulations!</b> You reached {conf.get('affiliate_req', 100)} members. ${reward} added!")
+            try: await send_msg(inviter_id, f"{pe('🎉')} <b>Congratulations!</b> You reached {new_count} active members. ${reward} added to your balance!")
             except: pass
 
+    # Let the admin know it was completed
     admin_name = html.escape(call.from_user.first_name or "Admin")
-    await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('✅')} <b>Accepted by {admin_name}</b>", markup=None)
-    await call.answer("Accepted!", show_alert=False)
+    try: await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('✅')} <b>Accepted (Real) by {admin_name}</b>", markup=None)
+    except: pass
+    await call.answer("Accepted as Real Affiliate!", show_alert=False)
 
+# 2. AFFILIATE REJECT BUTTON LOGIC
 @app.on_callback_query(filters.regex(r"^jrej_"))
 async def cb_jrej(client: Client, call: CallbackQuery):
     if not await is_admin(call.from_user.id): return await call.answer("Admins only.", show_alert=True)
@@ -1739,15 +1756,22 @@ async def cb_jrej(client: Client, call: CallbackQuery):
     user_id = int(user_id)
     inviter_id = int(inviter_id)
 
+    # Decline joining request
     try: await client.decline_chat_join_request(TRACK_GROUP_ID, user_id)
     except: pass
 
+    # Still mark as processed so they can't spam fake requests
     await users_db.update_one({"user_id": user_id}, {"$set": {"ever_joined_group": True}})
+    
+    # Mark as fake in inviter's profile
     await users_db.update_one({"user_id": inviter_id}, {"$addToSet": {"fake_affiliates": user_id}})
 
+    # Let the admin know it was handled
     admin_name = html.escape(call.from_user.first_name or "Admin")
-    await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('❌')} <b>Rejected (Marked Fake) by {admin_name}</b>", markup=None)
-    await call.answer("Rejected!", show_alert=False)
+    try: await edit_msg(call.message.chat.id, call.message.id, f"{call.message.text}\n\n{pe('❌')} <b>Rejected (Marked Fake) by {admin_name}</b>", markup=None)
+    except: pass
+    await call.answer("Rejected & Marked Fake!", show_alert=False)
+
 
 @app.on_callback_query(filters.regex("^tktacc_"))
 async def ticket_accept(client: Client, call: CallbackQuery):
